@@ -1,0 +1,7 @@
+# OVO INSTALIRAJ
+# python interpreter mora biti ovo /opt/homebrew/bin/python3.11
+# pip install -r requirements.txt
+
+requests
+beautifulsoup4
+prompt-toolkit
