@@ -9,6 +9,32 @@ OTHER = "other"
 CZECH_MARKERS = set("ěřůďťň")
 CROATIAN_MARKERS = set("čćđšž")
 
+# Short, high-frequency function words that carry little topical meaning
+# but can dilute relevance scoring (e.g. "je" matching as a substring
+# inside unrelated English words, or "tko"/"bio" adding noise tokens that
+# never appear in foreign-language source content). Only used to filter
+# tokens for *internal* ranking/sentence-selection — the raw query text
+# sent to search engines is never touched, so search quality/recall from
+# Google/Bing itself is unaffected.
+STOPWORDS = {
+    # Croatian
+    "je", "su", "tko", "sta", "šta", "bio", "bila", "bili", "koji", "koja",
+    "koje", "da", "li", "se", "za", "sa", "od", "do", "na", "u", "i", "a",
+    "kako", "kada", "gdje", "zasto", "zašto",
+    # English
+    "is", "are", "was", "were", "who", "what", "when", "where", "why",
+    "how", "the", "a", "an", "of", "to", "in", "on", "for", "and",
+}
+
+
+def filter_stopwords(tokens: list[str]) -> list[str]:
+    """Drop low-signal function words from a token list for scoring
+    purposes. If filtering would remove everything (e.g. the whole query
+    IS a stopword), keep the original tokens rather than scoring against
+    an empty set."""
+    filtered = [token for token in tokens if token not in STOPWORDS]
+    return filtered if filtered else tokens
+
 
 def tokenize(text: str) -> list[str]:
     words = re.findall(r"[a-zA-ZčćžšđČĆŽŠĐ0-9]+", text.lower())
@@ -59,6 +85,52 @@ def query_language_hint(query: str):
         return "hr"
 
     return None
+
+
+def detect_language(query: str) -> str:
+    """Best-effort ISO 639-1 language code for a query, used to steer the
+    search engines toward results in the right language instead of always
+    forcing English. Tries statistical detection first (works even on a
+    handful of words), then falls back to script/marker heuristics for the
+    very short queries where statistical detection is unreliable. Returns
+    "" (unknown) rather than guessing wrong, so callers can fall back to a
+    neutral, non-English-biased search instead."""
+    query = (query or "").strip()
+
+    if not query:
+        return ""
+
+    try:
+        from langdetect import detect, DetectorFactory, LangDetectException
+
+        DetectorFactory.seed = 0
+
+        try:
+            detected = detect(query)
+
+            if detected:
+                return detected
+
+        except LangDetectException:
+            pass
+
+    except ImportError:
+        pass
+
+    hint = query_language_hint(query)
+
+    if hint:
+        return hint
+
+    script = dominant_script(query)
+
+    if script == CYRILLIC:
+        return "ru"
+
+    if script == GREEK:
+        return "el"
+
+    return ""
 
 
 def has_foreign_markers(text: str, target_lang) -> bool:

@@ -12,6 +12,7 @@ class Thought:
     confidence: float
     reasoning: list[str]
     sources: list[dict] = field(default_factory=list)
+    preformatted: bool = False
 
 
 class ReasoningEngine:
