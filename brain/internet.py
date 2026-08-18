@@ -5,7 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import unquote, urlparse, parse_qs
 
-from brain.nlp_utils import tokenize, phrase_proximity_bonus
+from brain.nlp_utils import tokenize, phrase_proximity_bonus, detect_language, filter_stopwords
 
 
 class InternetEngine:
@@ -18,6 +18,7 @@ class InternetEngine:
 
     DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/"
     BING_URL = "https://www.bing.com/search"
+    GOOGLE_URL = "https://www.google.com/search"
 
     DEBUG = False
 
@@ -28,13 +29,15 @@ class InternetEngine:
     RESULT_ABS_FLOOR = 0.12  
     RESULT_REL_FLOOR = 0.40  
 
+    USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/139.0 Safari/537.36"
+    )
+
     HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/139.0 Safari/537.36"
-        ),
+        "User-Agent": USER_AGENT,
         "Accept": (
             "text/html,application/xhtml+xml,"
             "application/xml;q=0.9,*/*;q=0.8"
@@ -42,10 +45,69 @@ class InternetEngine:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+    # Bing "market" codes for the languages we can confidently target.
+    # Anything not in here falls back to letting Bing auto-detect the
+    # language from the query itself (no mkt/setlang forced), which is
+    # far better than forcing en-US on every query regardless of language.
+    BING_MARKETS = {
+        "en": "en-US", "hr": "hr-HR", "sr": "sr-Latn-RS", "bs": "bs-Latn-BA",
+        "sl": "sl-SI", "de": "de-DE", "fr": "fr-FR", "es": "es-ES",
+        "it": "it-IT", "pt": "pt-PT", "nl": "nl-NL", "pl": "pl-PL",
+        "cs": "cs-CZ", "sk": "sk-SK", "ru": "ru-RU", "uk": "uk-UA",
+        "tr": "tr-TR", "ar": "ar-SA", "zh-cn": "zh-CN", "zh": "zh-CN",
+        "ja": "ja-JP", "ko": "ko-KR", "hi": "hi-IN", "sv": "sv-SE",
+        "no": "nb-NO", "da": "da-DK", "fi": "fi-FI", "el": "el-GR",
+        "ro": "ro-RO", "hu": "hu-HU", "bg": "bg-BG", "he": "he-IL",
+        "th": "th-TH", "vi": "vi-VN", "id": "id-ID",
+    }
+
+    # DuckDuckGo "kl" region codes. Best-effort — DDG's list is smaller and
+    # inconsistently named, so unmapped languages fall back to "wt-wt"
+    # (worldwide, no forced region/language) instead of forcing US English.
+    DUCKDUCKGO_REGIONS = {
+        "en": "us-en", "hr": "hr-hr", "de": "de-de", "fr": "fr-fr",
+        "es": "es-es", "it": "it-it", "pt": "pt-pt", "nl": "nl-nl",
+        "pl": "pl-pl", "cs": "cz-cs", "sk": "sk-sk", "ru": "ru-ru",
+        "uk": "ua-uk", "tr": "tr-tr", "ar": "xa-ar", "zh-cn": "cn-zh",
+        "zh": "cn-zh", "ja": "jp-jp", "ko": "kr-kr", "hi": "in-hi",
+        "sv": "se-sv", "no": "no-no", "da": "dk-da", "fi": "fi-fi",
+        "el": "gr-el", "ro": "ro-ro", "hu": "hu-hu", "he": "il-he",
+        "th": "th-th", "vi": "vn-vi", "id": "id-en",
+    }
+
+    def _headers_for(self, lang: str) -> dict:
+        """Build request headers with an Accept-Language tailored to the
+        detected query language, instead of always claiming to only
+        accept English. English is kept as a low-priority fallback so
+        pages that only exist in English (e.g. technical docs) still work."""
+        headers = dict(self.HEADERS)
+
+        if lang and lang != "en":
+            headers["Accept-Language"] = f"{lang};q=0.9,en;q=0.5"
+
+        return headers
+
     def search(self, query: str, limit: int = 5) -> list[dict]:
         self._debug(f"Search query: {query}")
 
-        candidates = self._search_request(query, self.CANDIDATE_POOL)
+        lang = detect_language(query)
+        self._debug(f"Detected query language: {lang or 'unknown'}")
+
+        results = self._search_pass(query, limit, lang)
+
+        # If restricting to the detected language produced nothing useful
+        # (region has thin coverage, engine hiccup, wrong detection on a
+        # short/ambiguous query, etc.), retry once with no language/region
+        # restriction at all rather than just giving up. This keeps the
+        # language-matching as a *preference*, never a hard requirement.
+        if not results and lang:
+            self._debug(f"No results with lang='{lang}', retrying unrestricted")
+            results = self._search_pass(query, limit, "")
+
+        return results
+
+    def _search_pass(self, query: str, limit: int, lang: str) -> list[dict]:
+        candidates = self._search_request(query, self.CANDIDATE_POOL, lang)
         candidates = self._dedupe(candidates)
 
         self._debug(f"Search results: {len(candidates)}")
@@ -53,7 +115,7 @@ class InternetEngine:
         if not candidates:
             return []
 
-        query_tokens = tokenize(query)
+        query_tokens = filter_stopwords(tokenize(query))
 
         metadata_texts = [
             f"{candidate.get('title', '')} {candidate.get('snippet', '')} {candidate.get('url', '')}"
@@ -75,7 +137,7 @@ class InternetEngine:
         for candidate in fetch_pool:
             self._debug(f"Fetching: {candidate['title']}")
 
-            content = self._read_page(candidate["url"])
+            content = self._read_page(candidate["url"], lang=lang)
 
             if not content or len(content) < self.MIN_CONTENT_LENGTH:
                 self._debug(f"Page rejected: {candidate['title']}")
@@ -103,7 +165,18 @@ class InternetEngine:
         enriched.sort(key=lambda item: item["relevance"], reverse=True)
 
         top_score = enriched[0]["relevance"]
-        floor = max(self.RESULT_ABS_FLOOR, top_score * self.RESULT_REL_FLOOR) if top_score > 0 else 0
+
+        # If literally nothing fetched has any relevance to the query
+        # (zero token overlap with the content), don't return them as if
+        # they were results — that was the bug: floor collapsed to 0 in
+        # this case, so `relevance >= 0` let every irrelevant page through
+        # (e.g. random spam/ad pages when the search engines themselves
+        # returned poor results). No relevant content beats fake content.
+        if top_score <= 0:
+            self._debug("No candidate had any relevance to the query — discarding all.")
+            return []
+
+        floor = max(self.RESULT_ABS_FLOOR, top_score * self.RESULT_REL_FLOOR)
 
         filtered = [item for item in enriched if item["relevance"] >= floor][:limit]
 
@@ -252,32 +325,162 @@ class InternetEngine:
         lowered = html_text.lower()
         return any(marker in lowered for marker in self.BLOCK_MARKERS)
 
-    def _search_request(self, query: str, limit: int) -> list[dict]:
-        results = self._search_bing(query, limit)
+    def _search_request(self, query: str, limit: int, lang: str = "") -> list[dict]:
+        results = self._search_google(query, limit, lang)
+
+        if results:
+            return results
+
+        self._debug("Google returned nothing, falling back to Bing")
+        results = self._search_bing(query, limit, lang)
 
         if results:
             return results
 
         self._debug("Bing returned nothing, falling back to DuckDuckGo (html)")
-        results = self._search_duckduckgo(query, limit)
+        results = self._search_duckduckgo(query, limit, lang)
 
         if results:
             return results
 
         self._debug("DuckDuckGo (html) returned nothing, falling back to DuckDuckGo (lite)")
-        return self._search_duckduckgo_lite(query, limit)
+        return self._search_duckduckgo_lite(query, limit, lang)
 
-    def _search_bing(self, query: str, limit: int) -> list[dict]:
+    def _search_google(self, query: str, limit: int, lang: str = "") -> list[dict]:
+        """Google is the most comprehensive engine but also the most
+        aggressive about blocking scrapers (captchas, consent walls) —
+        that's why it's tried first but everything else still exists as
+        a fallback chain rather than relying on Google alone."""
+        params = {
+            "q": query,
+            "num": max(limit, 10),
+        }
+
+        if lang:
+            params["hl"] = lang
+            params["lr"] = f"lang_{lang}"
+
+        try:
+            response = requests.get(
+                self.GOOGLE_URL,
+                params=params,
+                headers=self._headers_for(lang),
+                timeout=15
+            )
+
+            self._debug(f"Google status: {response.status_code}, length: {len(response.text)}")
+
+            response.raise_for_status()
+
+        except requests.RequestException as error:
+            self._debug(f"Google request failed: {error}")
+            return []
+
+        if self._looks_blocked(response.text):
+            self._debug("Google appears to be showing a captcha/consent page instead of results")
+            self._dump_debug_html("google", response.text)
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        results = []
+
+        # Google's result markup changes often and isn't versioned, so we
+        # scan structurally (any heading-3 with a link ancestor) rather
+        # than pinning to specific class names, which tend to break
+        # silently after a redesign.
+        for heading in soup.select("h3"):
+            link = heading.find_parent("a", href=True)
+
+            if not link:
+                continue
+
+            raw_url = link.get("href")
+            url = self._clean_google_url(raw_url)
+
+            if not url:
+                continue
+
+            title = heading.get_text(" ", strip=True)
+
+            if not title:
+                continue
+
+            snippet = ""
+            result_block = heading.find_parent(["div", "article"])
+
+            if result_block:
+                snippet_candidates = result_block.find_all_next(
+                    ["div", "span"], limit=6
+                )
+
+                for candidate in snippet_candidates:
+                    text = candidate.get_text(" ", strip=True)
+
+                    if len(text) > 40 and text != title:
+                        snippet = text
+                        break
+
+            results.append({
+                "title": title,
+                "url": url,
+                "snippet": snippet
+            })
+
+            if len(results) >= limit:
+                break
+
+        if not results:
+            self._dump_debug_html("google", response.text)
+
+        return results
+
+    def _clean_google_url(self, url: str) -> str:
+        if not url:
+            return ""
+
+        if url.startswith("/url?"):
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            encoded_url = params.get("q") or params.get("url")
+
+            if encoded_url:
+                try:
+                    decoded = unquote(encoded_url[0])
+
+                    if decoded.startswith(("http://", "https://")):
+                        return decoded
+
+                except Exception:
+                    pass
+
+            return ""
+
+        if url.startswith(("http://", "https://")) and "google.com" not in urlparse(url).netloc:
+            return url
+
+        return ""
+
+    def _search_bing(self, query: str, limit: int, lang: str = "") -> list[dict]:
+        market = self.BING_MARKETS.get(lang)
+
+        params = {
+            "q": query,
+            "count": limit,
+        }
+
+        # Only force a market/language when we're confident about the
+        # detected language. Otherwise let Bing infer it from the query
+        # itself — much better than always claiming English.
+        if market:
+            params["mkt"] = market
+            params["setlang"] = lang
+
         try:
             response = requests.get(
                 self.BING_URL,
-                params={
-                    "q": query,
-                    "count": limit,
-                    "mkt": "en-US",
-                    "setlang": "en",
-                },
-                headers=self.HEADERS,
+                params=params,
+                headers=self._headers_for(lang),
                 timeout=15
             )
 
@@ -446,12 +649,14 @@ class InternetEngine:
 
         return ""
 
-    def _search_duckduckgo(self, query: str, limit: int) -> list[dict]:
+    def _search_duckduckgo(self, query: str, limit: int, lang: str = "") -> list[dict]:
+        region = self.DUCKDUCKGO_REGIONS.get(lang, "wt-wt")
+
         try:
             response = requests.post(
                 self.DUCKDUCKGO_URL,
-                data={"q": query, "kl": "us-en"},
-                headers=self.HEADERS,
+                data={"q": query, "kl": region},
+                headers=self._headers_for(lang),
                 timeout=15
             )
 
@@ -535,15 +740,17 @@ class InternetEngine:
 
         return ""
 
-    def _search_duckduckgo_lite(self, query: str, limit: int) -> list[dict]:
+    def _search_duckduckgo_lite(self, query: str, limit: int, lang: str = "") -> list[dict]:
         """DuckDuckGo's plain-HTML 'lite' endpoint. It has much lighter
         bot-detection than the main html.duckduckgo.com endpoint, so it's
         a useful last-resort fallback."""
+        region = self.DUCKDUCKGO_REGIONS.get(lang, "wt-wt")
+
         try:
             response = requests.get(
                 "https://lite.duckduckgo.com/lite/",
-                params={"q": query, "kl": "us-en"},
-                headers=self.HEADERS,
+                params={"q": query, "kl": region},
+                headers=self._headers_for(lang),
                 timeout=15
             )
 
@@ -599,11 +806,11 @@ class InternetEngine:
         return results
 
 
-    def _read_page(self, url: str, max_chars: int = 8000) -> str:
+    def _read_page(self, url: str, max_chars: int = 8000, lang: str = "") -> str:
         try:
             response = requests.get(
                 url,
-                headers=self.HEADERS,
+                headers=self._headers_for(lang),
                 timeout=10,
                 allow_redirects=True
             )

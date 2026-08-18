@@ -109,7 +109,7 @@ def wrap_width():
     return max(40, min(terminal_width - 4, WIDTH))
 
 
-def print_response(response):
+def print_response(response, preformatted=False):
     print()
 
     print(
@@ -120,6 +120,16 @@ def print_response(response):
 
     print(f"{GRAY}{'─' * 12}{RESET}")
     print()
+
+    if preformatted:
+        # Route boxes and other structured output already have their own
+        # fixed-width layout — re-wrapping them with textwrap would break
+        # the box-drawing alignment, so print them as-is.
+        print(f"{WHITE}{response}{RESET}")
+        print()
+        print(THIN_LINE)
+        print()
+        return
 
     width = wrap_width()
 
@@ -251,7 +261,7 @@ def main():
             finally:
                 spinner.stop()
 
-            print_response(response.answer)
+            print_response(response.answer, preformatted=response.preformatted)
 
         except KeyboardInterrupt:
             print()

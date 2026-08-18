@@ -1,6 +1,6 @@
 import math
 
-from brain.nlp_utils import tokenize, split_sentences, phrase_proximity_bonus
+from brain.nlp_utils import tokenize, split_sentences, phrase_proximity_bonus, filter_stopwords
 
 
 class AnswerSynthesizer:
@@ -18,7 +18,7 @@ class AnswerSynthesizer:
                 "sources": []
             }
 
-        query_tokens = tokenize(query)
+        query_tokens = filter_stopwords(tokenize(query))
 
         results = sorted(results, key=lambda item: item.get("relevance", 0), reverse=True)
 
@@ -31,6 +31,24 @@ class AnswerSynthesizer:
         scored = self._score_sentences(sentence_pool, query_tokens)
 
         if not scored:
+            # No sentence shares a keyword with the query — can happen
+            # when the fetched pages phrase things very differently than
+            # the question did. Rather than giving up outright, fall
+            # back to the opening sentences of the best-ranked source:
+            # a possibly-imperfect answer beats none.
+            fallback = [
+                sentence for sentence in sentence_pool
+                if sentence["source_index"] == 0
+            ][:self.MAX_SENTENCES]
+
+            if fallback:
+                answer = self._build_paragraph(fallback)
+
+                return {
+                    "answer": answer,
+                    "sources": self._build_sources(results, {0})
+                }
+
             return {
                 "answer": "I found some sources but couldn't extract a clear answer from them.",
                 "sources": self._build_sources(results, {0})
